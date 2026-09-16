@@ -78,13 +78,13 @@ EOF
 
 systemctl daemon-reload
 
-# 4. 首次拉起生成基础数据库并初始化管理员
+# 4. 首次拉起初始化数据库并配置管理员账密
 systemctl restart s-ui
 sleep 2
 echo "==> 正在配置面板管理员账号与密码..."
 (cd "$INSTALL_DIR" && ./sui admin -username "$PANEL_USER" -password "$PANEL_PASS")
 
-# 5. SNI 测速与优选
+# 5. 全量去重 SNI 握手测速
 echo "==> 正在对候选 SNI 域名执行 TCP/TLS 握手测速..."
 DOMAINS=(
     "amd.com" "d.impactradius-event.com" "t0.m.awsstatic.com" "acctcdn.msftauth.net" "www.oracle.com"
@@ -121,19 +121,18 @@ for d in "${UNIQUE_DOMAINS[@]}"; do
 done
 echo "==> 选定最低延迟 SNI: $BEST_SNI (${MIN_LATENCY} ms)"
 
-# 6. 生成证书和密钥数据
+# 6. 生成证书和密钥
 CERT_DIR=$(mktemp -d)
 openssl req -x509 -newkey rsa:2048 -nodes -sha256 -keyout "$CERT_DIR/self.key" -out "$CERT_DIR/self.crt" -days 3650 -subj "/CN=$BEST_SNI" 2>/dev/null
 CERT_PUBKEY_SHA256=$(openssl x509 -in "$CERT_DIR/self.crt" -pubkey -noout | openssl pkey -pubin -outform der | openssl dgst -sha256 -binary | base64)
 CERT_PUBKEY_HEX=$(openssl x509 -in "$CERT_DIR/self.crt" -pubkey -noout | openssl pkey -pubin -outform der | openssl dgst -sha256 -hex | awk '{print $2}')
 
-# 停止服务以修改数据库
 systemctl stop s-ui
 
 DB_FILE="$INSTALL_DIR/db/s-ui.db"
 IP=$(curl -4 -fsSL --max-time 5 https://api.ipify.org || curl -4 -fsSL --max-time 5 https://ifconfig.me || echo "127.0.0.1")
 
-# 7. 使用 Python 注入完全对齐的标准字节流结构
+# 7. Python 精准写入对齐官方架构的二进制 BLOB
 python3 - <<PYEOF
 import sqlite3
 import json
@@ -141,7 +140,6 @@ import uuid
 import secrets
 import base64
 import time
-import urllib.parse
 
 def to_blob(data):
     return sqlite3.Binary(json.dumps(data, indent=2).encode('utf-8'))
@@ -149,13 +147,11 @@ def to_blob(data):
 conn = sqlite3.connect("$DB_FILE")
 cur = conn.cursor()
 
-# 读取自签证书与私钥文本
 with open("$CERT_DIR/self.key", "r") as f:
     key_lines = [line.strip() for line in f if line.strip()]
 with open("$CERT_DIR/self.crt", "r") as f:
     crt_lines = [line.strip() for line in f if line.strip()]
 
-# 随机凭据生成
 reality_priv = secrets.token_urlsafe(32)[:43]
 reality_pub = secrets.token_urlsafe(32)[:43]
 short_id = secrets.token_hex(4)
@@ -165,7 +161,7 @@ client_pass = secrets.token_urlsafe(8)[:8]
 ss_pass_1 = base64.b64encode(secrets.token_bytes(32)).decode('utf-8')
 ss_pass_2 = base64.b64encode(secrets.token_bytes(16)).decode('utf-8')
 
-# 1. 写入 TLS 表
+# TLS 表
 cur.execute("DELETE FROM tls WHERE name IN ('一', '二')")
 
 tls_server_1 = {
@@ -211,7 +207,7 @@ cur.execute("INSERT INTO tls (name, server, client) VALUES (?, ?, ?)",
             ('二', to_blob(tls_server_2), to_blob(tls_client_2)))
 tls_2_id = cur.lastrowid
 
-# 2. 写入 inbounds 表
+# Inbounds 表 (tag 1: VLESS, tag 2: TUIC)
 cur.execute("DELETE FROM inbounds WHERE tag IN ('1', '2')")
 
 inbound_1_options = {
@@ -237,7 +233,7 @@ cur.execute("""
 """, ('tuic', '2', tls_2_id, to_blob([]), to_blob(inbound_2_options)))
 inbound_2_id = cur.lastrowid
 
-# 3. 写入 clients 表 (全字段严格匹配官方 schema)
+# Clients 表
 cur.execute("DELETE FROM clients WHERE name='My'")
 
 client_name = "My"
@@ -277,7 +273,7 @@ PYEOF
 
 rm -rf "$CERT_DIR"
 
-# 8. 启动服务并放行端口
+# 8. 启动服务与放行端口
 systemctl enable s-ui >/dev/null 2>&1
 systemctl restart s-ui
 
@@ -294,22 +290,24 @@ elif command -v firewall-cmd >/dev/null 2>&1; then
     firewall-cmd --reload >/dev/null 2>&1 || true
 fi
 
-# 9. 提取订阅 Token 并输出
+# 9. 输出通用订阅及专用 Clash 订阅链接
 CLIENT_UUID=$(sqlite3 "$DB_FILE" "SELECT json_extract(config, '$.vless.uuid') FROM clients WHERE name='My';" 2>/dev/null || echo "My")
-SUB_URL="http://${IP}:${SUB_PORT}/sub/${CLIENT_UUID}"
+SUB_URL_RAW="http://${IP}:${SUB_PORT}/sub/${CLIENT_UUID}"
+SUB_URL_CLASH="http://${IP}:${SUB_PORT}/sub/${CLIENT_UUID}?format=clash"
 
 echo ""
 echo "==================== 部署与配置完成 ===================="
-echo "面板后台地址 : http://${IP}:${PANEL_PORT}/app/"
-echo "管理员账号   : ${PANEL_USER}"
-echo "管理员密码   : ${PANEL_PASS}"
-echo "最低延迟 SNI : ${BEST_SNI} (${MIN_LATENCY} ms)"
+echo "面板后台地址   : http://${IP}:${PANEL_PORT}/app/"
+echo "管理员账号     : ${PANEL_USER}"
+echo "管理员密码     : ${PANEL_PASS}"
+echo "选定优选 SNI   : ${BEST_SNI} (${MIN_LATENCY} ms)"
 echo "--------------------------------------------------------"
-echo "订阅链接     : ${SUB_URL}"
+echo "小火箭/通用订阅: ${SUB_URL_RAW}"
+echo "Clash 订阅链接 : ${SUB_URL_CLASH}"
 echo "--------------------------------------------------------"
 if command -v qrencode >/dev/null 2>&1; then
-    echo "订阅二维码如下 (支持 Shadowrocket / Sing-box / Clash 等直接扫码):"
+    echo "小火箭扫码专用二维码:"
     echo ""
-    qrencode -t ANSIUTF8 "${SUB_URL}" || true
+    qrencode -t ANSIUTF8 "${SUB_URL_RAW}" || true
 fi
 echo "========================================================"
