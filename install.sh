@@ -7,6 +7,7 @@ if [ "$(id -u)" -ne 0 ]; then
     exit 1
 fi
 
+VERSION="v1.5.5"
 INSTALL_DIR="/usr/local/s-ui"
 
 # 2. 识别系统 CPU 架构
@@ -18,28 +19,18 @@ case "$ARCH" in
     *) echo "不支持的 CPU 架构: $ARCH" >&2; exit 1 ;;
 esac
 
-# 3. 安装依赖 (curl, tar)
+echo "==> 目标系统架构: ${TARGET_ARCH}，版本: ${VERSION}"
+
+# 3. 安装解压与网络工具
 if command -v apt-get >/dev/null 2>&1; then
     apt-get update -qq && apt-get install -y -qq curl tar
 elif command -v yum >/dev/null 2>&1; then
     yum install -y -q curl tar || true
 fi
 
-# 4. 获取 s-ui 最新版本号并规范化（去除多余的 'v' 前缀）
-echo "==> 正在获取 s-ui 最新版本..."
-LATEST_JSON=$(curl -fsSL https://api.github.com/repos/alireza0/s-ui/releases/latest || true)
-TAG_NAME=$(echo "$LATEST_JSON" | grep -o '"tag_name": *"[^"]*"' | head -n 1 | cut -d'"' -f4)
-
-if [ -z "$TAG_NAME" ]; then
-    TAG_NAME="v1.6.3"
-fi
-# 确保 TAG_NAME 以 v 开头
-[[ "$TAG_NAME" =~ ^v ]] || TAG_NAME="v${TAG_NAME}"
-echo "==> 目标安装版本: ${TAG_NAME} (${TARGET_ARCH})"
-
-# 5. 直接下载官方预编译二进制包（绕过官方不兼容的 install.sh）
-DOWNLOAD_URL="https://github.com/alireza0/s-ui/releases/download/${TAG_NAME}/s-ui-linux-${TARGET_ARCH}.tar.gz"
-echo "==> 正在下载安装包: ${DOWNLOAD_URL}"
+# 4. 直接拉取 v1.5.5 官方预编译二进制包
+DOWNLOAD_URL="https://github.com/alireza0/s-ui/releases/download/${VERSION}/s-ui-linux-${TARGET_ARCH}.tar.gz"
+echo "==> 正在下载: ${DOWNLOAD_URL}"
 
 mkdir -p "$INSTALL_DIR"
 TMP_DIR=$(mktemp -d)
@@ -48,11 +39,11 @@ tar -zxf "$TMP_DIR/s-ui.tar.gz" -C "$INSTALL_DIR"
 rm -rf "$TMP_DIR"
 chmod +x "$INSTALL_DIR/s-ui"
 
-# 软链接命令到全局 PATH
+# 建立全局软链接
 ln -sf "$INSTALL_DIR/s-ui" /usr/local/bin/s-ui
 ln -sf "$INSTALL_DIR/s-ui" /usr/bin/s-ui
 
-# 6. 配置 systemd 服务
+# 5. 注册 systemd 服务
 cat <<EOF > /etc/systemd/system/s-ui.service
 [Unit]
 Description=s-ui service
@@ -75,16 +66,18 @@ systemctl daemon-reload
 systemctl enable s-ui >/dev/null 2>&1
 systemctl restart s-ui
 
-# 7. 设置管理员账号和密码
-echo "==> 正在配置面板管理员账号密码..."
+# 6. 配置指定用户名与密码
+echo "==> 正在配置面板管理员账号与密码..."
 sleep 2
 s-ui reset-user -u tiangeben -p tiangeben2024 || s-ui user -u tiangeben -p tiangeben2024 || true
 systemctl restart s-ui
 
-# 8. 获取公网 IP 并输出信息
+# 7. 获取公网 IP 并输出信息
 IP=$(curl -4 -fsSL --max-time 5 https://api.ipify.org || curl -4 -fsSL --max-time 5 https://ifconfig.me || echo "你的VPS公网IP")
 echo ""
 echo "================ 部署完成 ================"
+echo "系统架构: $TARGET_ARCH"
+echo "版本状态: $VERSION"
 echo "面板地址: http://${IP}:2096"
 echo "用户名  : tiangeben"
 echo "密码    : tiangeben2024"
