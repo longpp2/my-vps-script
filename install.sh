@@ -24,14 +24,14 @@ esac
 
 echo "==> 目标系统架构: ${TARGET_ARCH}，版本: ${VERSION}"
 
-# 3. 安装依赖
+# 3. 安装依赖 (curl, tar)
 if command -v apt-get >/dev/null 2>&1; then
     apt-get update -qq && apt-get install -y -qq curl tar
 elif command -v yum >/dev/null 2>&1; then
     yum install -y -q curl tar || true
 fi
 
-# 4. 清理旧残留并下载解压
+# 4. 下载官方预编译二进制包并自适应解压
 rm -rf "$INSTALL_DIR"
 mkdir -p "$INSTALL_DIR"
 TMP_DIR=$(mktemp -d)
@@ -41,16 +41,7 @@ echo "==> 正在下载: ${DOWNLOAD_URL}"
 curl -fL "$DOWNLOAD_URL" -o "$TMP_DIR/s-ui.tar.gz"
 tar -zxf "$TMP_DIR/s-ui.tar.gz" -C "$TMP_DIR"
 
-# 智能提取核心可执行文件（自动搜索解压出来的可执行程序）
-TARGET_BIN=$(find "$TMP_DIR" -type f \( -name "sui" -o -name "s-ui" \) | head -n 1)
-
-if [ -z "$TARGET_BIN" ]; then
-    echo "错误：压缩包内未找到可执行文件！解压内容如下：" >&2
-    ls -laR "$TMP_DIR"
-    exit 1
-fi
-
-# 将所有解压内容平铺移入目标目录
+# 兼容提取解压出来的文件
 if [ -d "$TMP_DIR/s-ui" ]; then
     cp -rf "$TMP_DIR/s-ui/"* "$INSTALL_DIR/"
 else
@@ -58,11 +49,12 @@ else
 fi
 rm -rf "$TMP_DIR"
 
-# 确保主二进制名为 sui
+# 确保核心二进制命名为 sui
 if [ ! -f "$INSTALL_DIR/sui" ] && [ -f "$INSTALL_DIR/s-ui" ]; then
     mv "$INSTALL_DIR/s-ui" "$INSTALL_DIR/sui"
 fi
 
+# 赋予执行权限并建立软链接
 chmod +x "$INSTALL_DIR/sui"
 ln -sf "$INSTALL_DIR/sui" /usr/local/bin/s-ui
 ln -sf "$INSTALL_DIR/sui" /usr/bin/s-ui
@@ -92,13 +84,12 @@ systemctl daemon-reload
 systemctl enable s-ui >/dev/null 2>&1
 systemctl restart s-ui
 
-# 6. 配置指定用户名与密码
+# 6. 配置管理员账号密码 (使用官方原生 admin 语法)
 echo "==> 正在配置面板管理员账号与密码..."
 sleep 2
-"$INSTALL_DIR/sui" reset-user -u "$PANEL_USER" -p "$PANEL_PASS" || "$INSTALL_DIR/sui" user -u "$PANEL_USER" -p "$PANEL_PASS" || true
-systemctl restart s-ui
+"$INSTALL_DIR/sui" admin -username "$PANEL_USER" -password "$PANEL_PASS"
 
-# 7. 防火墙端口放行
+# 7. 配置防火墙放行端口
 if command -v ufw >/dev/null 2>&1; then
     ufw allow "${PANEL_PORT}/tcp" >/dev/null 2>&1 || true
 elif command -v firewall-cmd >/dev/null 2>&1; then
@@ -106,15 +97,18 @@ elif command -v firewall-cmd >/dev/null 2>&1; then
     firewall-cmd --reload >/dev/null 2>&1 || true
 fi
 
-# 8. 输出结果
+systemctl restart s-ui
+
+# 8. 获取公网 IP 与完整的面板访问 URI（含安全路径后缀）
 IP=$(curl -4 -fsSL --max-time 5 https://api.ipify.org || curl -4 -fsSL --max-time 5 https://ifconfig.me || echo "你的VPS公网IP")
+PANEL_URI=$("$INSTALL_DIR/sui" uri 2>/dev/null | grep -E "^https?://" || echo "http://${IP}:${PANEL_PORT}/")
 
 echo ""
 echo "================ 部署完成 ================"
 echo "系统架构: $TARGET_ARCH"
 echo "版本状态: $VERSION"
-echo "面板地址: http://${IP}:${PANEL_PORT}"
-echo "备用安全: https://${IP}:${PANEL_PORT}"
-echo "用户名  : ${PANEL_USER}"
-echo "密码    : ${PANEL_PASS}"
+echo "面板完整地址 : ${PANEL_URI}"
+echo "管理员账号   : ${PANEL_USER}"
+echo "管理员密码   : ${PANEL_PASS}"
 echo "=========================================="
+echo "注意：s-ui 带有安全防探测路径，必须完整复制上面的【面板完整地址】在浏览器中打开！"
