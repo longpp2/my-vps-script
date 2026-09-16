@@ -9,6 +9,9 @@ fi
 
 VERSION="v1.5.5"
 INSTALL_DIR="/usr/local/s-ui"
+PANEL_USER="tiangeben"
+PANEL_PASS="tiangeben2024"
+PANEL_PORT="2096"
 
 # 2. 识别系统 CPU 架构
 ARCH=$(uname -m)
@@ -28,7 +31,7 @@ elif command -v yum >/dev/null 2>&1; then
     yum install -y -q curl tar || true
 fi
 
-# 4. 直接拉取 v1.5.5 官方预编译二进制包
+# 4. 下载官方预编译二进制包并解压
 DOWNLOAD_URL="https://github.com/alireza0/s-ui/releases/download/${VERSION}/s-ui-linux-${TARGET_ARCH}.tar.gz"
 echo "==> 正在下载: ${DOWNLOAD_URL}"
 
@@ -37,13 +40,15 @@ TMP_DIR=$(mktemp -d)
 curl -fL "$DOWNLOAD_URL" -o "$TMP_DIR/s-ui.tar.gz"
 tar -zxf "$TMP_DIR/s-ui.tar.gz" -C "$INSTALL_DIR"
 rm -rf "$TMP_DIR"
-chmod +x "$INSTALL_DIR/s-ui"
 
-# 建立全局软链接
-ln -sf "$INSTALL_DIR/s-ui" /usr/local/bin/s-ui
-ln -sf "$INSTALL_DIR/s-ui" /usr/bin/s-ui
+# 修正可执行权限与软链接（二进制文件名为 sui）
+chmod +x "$INSTALL_DIR/sui"
+ln -sf "$INSTALL_DIR/sui" /usr/local/bin/s-ui
+ln -sf "$INSTALL_DIR/sui" /usr/bin/s-ui
+ln -sf "$INSTALL_DIR/sui" /usr/local/bin/sui
+ln -sf "$INSTALL_DIR/sui" /usr/bin/sui
 
-# 5. 注册 systemd 服务
+# 5. 配置 systemd 服务 (ExecStart 指向 sui)
 cat <<EOF > /etc/systemd/system/s-ui.service
 [Unit]
 Description=s-ui service
@@ -53,7 +58,7 @@ After=network.target
 Type=simple
 User=root
 WorkingDirectory=${INSTALL_DIR}
-ExecStart=${INSTALL_DIR}/s-ui
+ExecStart=${INSTALL_DIR}/sui
 Restart=on-failure
 RestartSec=5s
 LimitNOFILE=65535
@@ -69,16 +74,27 @@ systemctl restart s-ui
 # 6. 配置指定用户名与密码
 echo "==> 正在配置面板管理员账号与密码..."
 sleep 2
-s-ui reset-user -u tiangeben -p tiangeben2024 || s-ui user -u tiangeben -p tiangeben2024 || true
+"$INSTALL_DIR/sui" reset-user -u "$PANEL_USER" -p "$PANEL_PASS" || "$INSTALL_DIR/sui" user -u "$PANEL_USER" -p "$PANEL_PASS" || true
 systemctl restart s-ui
 
-# 7. 获取公网 IP 并输出信息
+# 7. 放行本地防火墙（如果有）
+if command -v ufw >/dev/null 2>&1; then
+    ufw allow "${PANEL_PORT}/tcp" >/dev/null 2>&1 || true
+elif command -v firewall-cmd >/dev/null 2>&1; then
+    firewall-cmd --zone=public --add-port="${PANEL_PORT}/tcp" --permanent >/dev/null 2>&1 || true
+    firewall-cmd --reload >/dev/null 2>&1 || true
+fi
+
+# 8. 获取公网 IP 并输出信息
 IP=$(curl -4 -fsSL --max-time 5 https://api.ipify.org || curl -4 -fsSL --max-time 5 https://ifconfig.me || echo "你的VPS公网IP")
+
 echo ""
 echo "================ 部署完成 ================"
 echo "系统架构: $TARGET_ARCH"
 echo "版本状态: $VERSION"
-echo "面板地址: http://${IP}:2096"
-echo "用户名  : tiangeben"
-echo "密码    : tiangeben2024"
+echo "面板地址: http://${IP}:${PANEL_PORT}"
+echo "备用安全: https://${IP}:${PANEL_PORT}"
+echo "用户名  : ${PANEL_USER}"
+echo "密码    : ${PANEL_PASS}"
 echo "=========================================="
+echo "提示：若网页无法打开，请确保云厂商控制台安全组已放行 TCP ${PANEL_PORT} 端口。"
