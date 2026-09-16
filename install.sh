@@ -31,7 +31,7 @@ elif command -v yum >/dev/null 2>&1; then
     yum install -y -q curl tar || true
 fi
 
-# 4. 下载官方预编译二进制包并自适应解压
+# 4. 下载预编译二进制包并自适应解压
 rm -rf "$INSTALL_DIR"
 mkdir -p "$INSTALL_DIR"
 TMP_DIR=$(mktemp -d)
@@ -41,7 +41,6 @@ echo "==> 正在下载: ${DOWNLOAD_URL}"
 curl -fL "$DOWNLOAD_URL" -o "$TMP_DIR/s-ui.tar.gz"
 tar -zxf "$TMP_DIR/s-ui.tar.gz" -C "$TMP_DIR"
 
-# 兼容提取解压出来的文件
 if [ -d "$TMP_DIR/s-ui" ]; then
     cp -rf "$TMP_DIR/s-ui/"* "$INSTALL_DIR/"
 else
@@ -54,7 +53,6 @@ if [ ! -f "$INSTALL_DIR/sui" ] && [ -f "$INSTALL_DIR/s-ui" ]; then
     mv "$INSTALL_DIR/s-ui" "$INSTALL_DIR/sui"
 fi
 
-# 赋予执行权限并建立软链接
 chmod +x "$INSTALL_DIR/sui"
 ln -sf "$INSTALL_DIR/sui" /usr/local/bin/s-ui
 ln -sf "$INSTALL_DIR/sui" /usr/bin/s-ui
@@ -81,15 +79,16 @@ WantedBy=multi-user.target
 EOF
 
 systemctl daemon-reload
+
+# 6. 配置面板：清空随机安全路径并设定账号密码
+echo "==> 正在初始化面板设置与管理员账号..."
+"$INSTALL_DIR/sui" setting -path ""
+"$INSTALL_DIR/sui" admin -reset -username "$PANEL_USER" -password "$PANEL_PASS"
+
+# 7. 启动服务与配置防火墙
 systemctl enable s-ui >/dev/null 2>&1
 systemctl restart s-ui
 
-# 6. 配置管理员账号密码 (使用官方原生 admin 语法)
-echo "==> 正在配置面板管理员账号与密码..."
-sleep 2
-"$INSTALL_DIR/sui" admin -username "$PANEL_USER" -password "$PANEL_PASS"
-
-# 7. 配置防火墙放行端口
 if command -v ufw >/dev/null 2>&1; then
     ufw allow "${PANEL_PORT}/tcp" >/dev/null 2>&1 || true
 elif command -v firewall-cmd >/dev/null 2>&1; then
@@ -97,18 +96,14 @@ elif command -v firewall-cmd >/dev/null 2>&1; then
     firewall-cmd --reload >/dev/null 2>&1 || true
 fi
 
-systemctl restart s-ui
-
-# 8. 获取公网 IP 与完整的面板访问 URI（含安全路径后缀）
+# 8. 获取公网 IP 并输出信息
 IP=$(curl -4 -fsSL --max-time 5 https://api.ipify.org || curl -4 -fsSL --max-time 5 https://ifconfig.me || echo "你的VPS公网IP")
-PANEL_URI=$("$INSTALL_DIR/sui" uri 2>/dev/null | grep -E "^https?://" || echo "http://${IP}:${PANEL_PORT}/")
 
 echo ""
 echo "================ 部署完成 ================"
 echo "系统架构: $TARGET_ARCH"
 echo "版本状态: $VERSION"
-echo "面板完整地址 : ${PANEL_URI}"
-echo "管理员账号   : ${PANEL_USER}"
-echo "管理员密码   : ${PANEL_PASS}"
+echo "面板地址: http://${IP}:${PANEL_PORT}"
+echo "管理员账号: ${PANEL_USER}"
+echo "管理员密码: ${PANEL_PASS}"
 echo "=========================================="
-echo "注意：s-ui 带有安全防探测路径，必须完整复制上面的【面板完整地址】在浏览器中打开！"
