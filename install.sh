@@ -21,7 +21,7 @@ case "$ARCH" in
     *) echo "不支持的 CPU 架构: $ARCH" >&2; exit 1 ;;
 esac
 
-echo "==> 目标架构: ${TARGET_ARCH}，面板版本: ${VERSION}"
+echo "==> 目标系统架构: ${TARGET_ARCH}，面板版本: ${VERSION}"
 
 # 1. 安装基础依赖
 if command -v apt-get >/dev/null 2>&1; then
@@ -30,7 +30,7 @@ elif command -v yum >/dev/null 2>&1; then
     yum install -y -q curl tar openssl sqlite qrencode python3 || true
 fi
 
-# 2. 下载并解压程序
+# 2. 下载并解压安装
 rm -rf "$INSTALL_DIR"
 mkdir -p "$INSTALL_DIR"
 TMP_DIR=$(mktemp -d)
@@ -78,13 +78,13 @@ EOF
 
 systemctl daemon-reload
 
-# 4. 首次启动初始化数据库并重置账密
+# 4. 首次拉起生成基础数据库并初始化管理员
 systemctl restart s-ui
 sleep 2
-echo "==> 正在配置管理员账号与密码..."
+echo "==> 正在配置面板管理员账号与密码..."
 (cd "$INSTALL_DIR" && ./sui admin -username "$PANEL_USER" -password "$PANEL_PASS")
 
-# 5. 全量去重 SNI 握手测速
+# 5. SNI 测速与优选
 echo "==> 正在对候选 SNI 域名执行 TCP/TLS 握手测速..."
 DOMAINS=(
     "amd.com" "d.impactradius-event.com" "t0.m.awsstatic.com" "acctcdn.msftauth.net" "www.oracle.com"
@@ -104,7 +104,7 @@ DOMAINS=(
 )
 
 UNIQUE_DOMAINS=($(printf "%s\n" "${DOMAINS[@]}" | sort -u))
-BEST_SNI="visualstudio.microsoft.com"
+BEST_SNI="d.oracleinfinity.io"
 MIN_LATENCY=99999
 
 for d in "${UNIQUE_DOMAINS[@]}"; do
@@ -121,120 +121,163 @@ for d in "${UNIQUE_DOMAINS[@]}"; do
 done
 echo "==> 选定最低延迟 SNI: $BEST_SNI (${MIN_LATENCY} ms)"
 
-# 6. 生成证书与 REALITY 密钥对
-CERT_DIR="$INSTALL_DIR/cert"
-mkdir -p "$CERT_DIR"
+# 6. 生成证书和密钥数据
+CERT_DIR=$(mktemp -d)
 openssl req -x509 -newkey rsa:2048 -nodes -sha256 -keyout "$CERT_DIR/self.key" -out "$CERT_DIR/self.crt" -days 3650 -subj "/CN=$BEST_SNI" 2>/dev/null
+CERT_PUBKEY_SHA256=$(openssl x509 -in "$CERT_DIR/self.crt" -pubkey -noout | openssl pkey -pubin -outform der | openssl dgst -sha256 -binary | base64)
+CERT_PUBKEY_HEX=$(openssl x509 -in "$CERT_DIR/self.crt" -pubkey -noout | openssl pkey -pubin -outform der | openssl dgst -sha256 -hex | awk '{print $2}')
 
-REALITY_PRIV="eA_GjK0uF_Yw0_uI2t_b1gN5fE7hD9lM6aC4oP8rS2k"
-REALITY_PUB="sK_HlP3vG_Zx1_vJ3u_c2hO6gF8iE0mN7bD5pQ9tT3l"
-if command -v sing-box >/dev/null 2>&1; then
-    KP=$(sing-box generate reality-keypair 2>/dev/null || true)
-    if [ -n "$KP" ]; then
-        REALITY_PRIV=$(echo "$KP" | grep "PrivateKey" | awk '{print $2}')
-        REALITY_PUB=$(echo "$KP" | grep "PublicKey" | awk '{print $2}')
-    fi
-fi
-SHORT_ID=$(openssl rand -hex 8)
-USER_UUID=$(cat /proc/sys/kernel/random/uuid 2>/dev/null || openssl rand -hex 16)
-TUIC_PASS=$(openssl rand -base64 12 | tr -d '=+/' | cut -c1-12)
+# 停止服务以修改数据库
+systemctl stop s-ui
 
 DB_FILE="$INSTALL_DIR/db/s-ui.db"
 IP=$(curl -4 -fsSL --max-time 5 https://api.ipify.org || curl -4 -fsSL --max-time 5 https://ifconfig.me || echo "127.0.0.1")
 
-# 7. 停止服务，利用 Python 对齐实际表结构注入数据
-systemctl stop s-ui
-
+# 7. 使用 Python 注入完全对齐的标准字节流结构
 python3 - <<PYEOF
 import sqlite3
 import json
+import uuid
+import secrets
+import base64
 import time
+import urllib.parse
+
+def to_blob(data):
+    return sqlite3.Binary(json.dumps(data, indent=2).encode('utf-8'))
 
 conn = sqlite3.connect("$DB_FILE")
 cur = conn.cursor()
 
-# 1. 写入 tls 表
+# 读取自签证书与私钥文本
+with open("$CERT_DIR/self.key", "r") as f:
+    key_lines = [line.strip() for line in f if line.strip()]
+with open("$CERT_DIR/self.crt", "r") as f:
+    crt_lines = [line.strip() for line in f if line.strip()]
+
+# 随机凭据生成
+reality_priv = secrets.token_urlsafe(32)[:43]
+reality_pub = secrets.token_urlsafe(32)[:43]
+short_id = secrets.token_hex(4)
+
+client_uuid = str(uuid.uuid4())
+client_pass = secrets.token_urlsafe(8)[:8]
+ss_pass_1 = base64.b64encode(secrets.token_bytes(32)).decode('utf-8')
+ss_pass_2 = base64.b64encode(secrets.token_bytes(16)).decode('utf-8')
+
+# 1. 写入 TLS 表
 cur.execute("DELETE FROM tls WHERE name IN ('一', '二')")
 
-server_1 = {
+tls_server_1 = {
     "enabled": True,
     "reality": {
         "enabled": True,
-        "handshake": {"server": "$BEST_SNI", "port": 443},
-        "private_key": "$REALITY_PRIV",
-        "short_ids": ["$SHORT_ID"],
-        "max_time_diff": 60000
+        "handshake": {
+            "server": "$BEST_SNI",
+            "server_port": 443
+        },
+        "private_key": reality_priv,
+        "short_id": ["", short_id]
+    },
+    "server_name": "$BEST_SNI"
+}
+tls_client_1 = {
+    "reality": {
+        "public_key": reality_pub
+    },
+    "utls": {
+        "enabled": True,
+        "fingerprint": "chrome"
     }
 }
-client_1 = {
+
+tls_server_2 = {
     "enabled": True,
-    "reality": {
-        "enabled": True,
-        "public_key": "$REALITY_PUB",
-        "short_id": "$SHORT_ID"
-    },
-    "server_name": "$BEST_SNI",
-    "utls": {"enabled": True, "fingerprint": "chrome"}
+    "key": key_lines,
+    "certificate": crt_lines,
+    "alpn": ["h3", "h2", "http/1.1"],
+    "server_name": "$BEST_SNI"
+}
+tls_client_2 = {
+    "certificate_public_key_sha256": ["$CERT_PUBKEY_SHA256"],
+    "insecure": True
 }
 
-server_2 = {
-    "enabled": True,
-    "certificate_path": "$CERT_DIR/self.crt",
-    "key_path": "$CERT_DIR/self.key",
-    "alpn": ["h3", "spdy/3.1"]
-}
-client_2 = {
-    "enabled": True,
-    "insecure": True,
-    "server_name": "$BEST_SNI",
-    "alpn": ["h3", "spdy/3.1"]
-}
-
-cur.execute("INSERT INTO tls (name, server, client) VALUES (?, ?, ?)", ('一', json.dumps(server_1), json.dumps(client_1)))
+cur.execute("INSERT INTO tls (name, server, client) VALUES (?, ?, ?)",
+            ('一', to_blob(tls_server_1), to_blob(tls_client_1)))
 tls_1_id = cur.lastrowid
 
-cur.execute("INSERT INTO tls (name, server, client) VALUES (?, ?, ?)", ('二', json.dumps(server_2), json.dumps(client_2)))
+cur.execute("INSERT INTO tls (name, server, client) VALUES (?, ?, ?)",
+            ('二', to_blob(tls_server_2), to_blob(tls_client_2)))
 tls_2_id = cur.lastrowid
 
-# 2. 写入 inbounds 表 (VLESS TCP 443, TUIC UDP 443)
+# 2. 写入 inbounds 表
 cur.execute("DELETE FROM inbounds WHERE tag IN ('1', '2')")
 
-vless_options = {"network": "tcp"}
-tuic_options = {"congestion_control": "bbr", "zero_rtt_handshake": False}
+inbound_1_options = {
+    "listen": "::",
+    "listen_port": 443,
+    "transport": {}
+}
+inbound_2_options = {
+    "congestion_control": "bbr",
+    "listen": "::",
+    "listen_port": 443
+}
 
 cur.execute("""
     INSERT INTO inbounds (type, tag, tls_id, addrs, options)
     VALUES (?, ?, ?, ?, ?)
-""", ('vless', '1', tls_1_id, json.dumps([{"listen": "0.0.0.0", "port": 443}]), json.dumps(vless_options)))
+""", ('vless', '1', tls_1_id, to_blob([]), to_blob(inbound_1_options)))
 inbound_1_id = cur.lastrowid
 
 cur.execute("""
     INSERT INTO inbounds (type, tag, tls_id, addrs, options)
     VALUES (?, ?, ?, ?, ?)
-""", ('tuic', '2', tls_2_id, json.dumps([{"listen": "0.0.0.0", "port": 443}]), json.dumps(tuic_options)))
+""", ('tuic', '2', tls_2_id, to_blob([]), to_blob(inbound_2_options)))
 inbound_2_id = cur.lastrowid
 
-# 3. 写入 clients 表
+# 3. 写入 clients 表 (全字段严格匹配官方 schema)
 cur.execute("DELETE FROM clients WHERE name='My'")
 
-client_config = {
-    "uuid": "$USER_UUID",
-    "password": "$TUIC_PASS"
+client_name = "My"
+full_config = {
+    "anytls": {"name": client_name, "password": client_pass},
+    "http": {"name": client_name, "username": client_name, "password": client_pass},
+    "hysteria": {"name": client_name, "auth_str": client_pass},
+    "hysteria2": {"name": client_name, "password": client_pass},
+    "mixed": {"name": client_name, "username": client_name, "password": client_pass},
+    "naive": {"name": client_name, "username": client_name, "password": client_pass},
+    "shadowsocks": {"name": client_name, "password": ss_pass_1},
+    "shadowsocks16": {"name": client_name, "password": ss_pass_2},
+    "shadowtls": {"name": client_name, "password": ss_pass_1},
+    "socks": {"name": client_name, "username": client_name, "password": client_pass},
+    "trojan": {"name": client_name, "password": client_pass},
+    "tuic": {"name": client_name, "uuid": client_uuid, "password": client_pass},
+    "vless": {"name": client_name, "uuid": client_uuid, "flow": "xtls-rprx-vision"},
+    "vmess": {"name": client_name, "uuid": client_uuid, "alterId": 0}
 }
 
-vless_link = f"vless://$USER_UUID@$IP:443?encryption=none&flow=&security=reality&sni=$BEST_SNI&fp=chrome&pbk=$REALITY_PUB&sid=$SHORT_ID&type=tcp#VLESS-$BEST_SNI"
-tuic_link = f"tuic://$USER_UUID:$TUIC_PASS@$IP:443?congestion_control=bbr&alpn=h3&sni=$BEST_SNI&allow_insecure=1#TUIC-$BEST_SNI"
+vless_uri = f"vless://{client_uuid}@$IP:443?type=tcp&security=reality&pbk={reality_pub}&sid={short_id}&fp=chrome&sni=$BEST_SNI&flow=xtls-rprx-vision#%E4%B8%80"
+tuic_uri = f"tuic://{client_uuid}:{client_pass}@$IP:443?security=tls&insecure=1&pcs=$CERT_PUBKEY_HEX&sni=$BEST_SNI&alpn=h3,h2,http/1.1&congestion_control=bbr#%E4%BA%8C"
+
+client_links = [
+    {"remark": "一", "type": "local", "uri": vless_uri},
+    {"remark": "二", "type": "local", "uri": tuic_uri}
+]
 
 cur.execute("""
     INSERT INTO clients (enable, name, config, inbounds, links, created_at)
     VALUES (?, ?, ?, ?, ?, ?)
-""", (1, 'My', json.dumps(client_config), json.dumps([inbound_1_id, inbound_2_id]), json.dumps([vless_link, tuic_link]), int(time.time())))
+""", (1, client_name, to_blob(full_config), to_blob([inbound_1_id, inbound_2_id]), to_blob(client_links), int(time.time())))
 
 conn.commit()
 conn.close()
 PYEOF
 
-# 8. 启动面板并放行所有端口
+rm -rf "$CERT_DIR"
+
+# 8. 启动服务并放行端口
 systemctl enable s-ui >/dev/null 2>&1
 systemctl restart s-ui
 
@@ -251,19 +294,21 @@ elif command -v firewall-cmd >/dev/null 2>&1; then
     firewall-cmd --reload >/dev/null 2>&1 || true
 fi
 
-SUB_URL="http://${IP}:${SUB_PORT}/sub/${USER_UUID}"
+# 9. 提取订阅 Token 并输出
+CLIENT_UUID=$(sqlite3 "$DB_FILE" "SELECT json_extract(config, '$.vless.uuid') FROM clients WHERE name='My';" 2>/dev/null || echo "My")
+SUB_URL="http://${IP}:${SUB_PORT}/sub/${CLIENT_UUID}"
 
 echo ""
 echo "==================== 部署与配置完成 ===================="
 echo "面板后台地址 : http://${IP}:${PANEL_PORT}/app/"
 echo "管理员账号   : ${PANEL_USER}"
 echo "管理员密码   : ${PANEL_PASS}"
-echo "选定优选 SNI : ${BEST_SNI} (${MIN_LATENCY} ms)"
+echo "最低延迟 SNI : ${BEST_SNI} (${MIN_LATENCY} ms)"
 echo "--------------------------------------------------------"
 echo "订阅链接     : ${SUB_URL}"
 echo "--------------------------------------------------------"
 if command -v qrencode >/dev/null 2>&1; then
-    echo "订阅二维码如下 (请直接使用客户端扫码):"
+    echo "订阅二维码如下 (支持 Shadowrocket / Sing-box / Clash 等直接扫码):"
     echo ""
     qrencode -t ANSIUTF8 "${SUB_URL}" || true
 fi
