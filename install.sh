@@ -8,10 +8,36 @@ fi
 
 VERSION="v1.5.5"
 INSTALL_DIR="/usr/local/s-ui"
-PANEL_USER="tiangeben"
-PANEL_PASS="tiangeben2024"
 PANEL_PORT="2095"
 SUB_PORT="2096"
+
+# ----------------- 账号密码交互配置 -----------------
+echo "=========================================="
+echo "          s-ui 面板管理员凭据设置         "
+echo "=========================================="
+
+RANDOM_USER="admin_$(openssl rand -hex 3)"
+RANDOM_PASS=$(openssl rand -base64 12 | tr -d '=+/' | cut -c1-12)
+
+# 读取终端交互输入（兼容 curl | bash 模式）
+exec 3<&0
+if [ -t 0 ]; then
+    INPUT_SRC="/dev/stdin"
+else
+    INPUT_SRC="/dev/tty"
+fi
+
+read -r -p "请输入管理员账号 [直接回车随机生成: ${RANDOM_USER}]: " INPUT_USER < "$INPUT_SRC" || true
+PANEL_USER="${INPUT_USER:-$RANDOM_USER}"
+
+read -r -p "请输入管理员密码 [直接回车随机生成: ${RANDOM_PASS}]: " INPUT_PASS < "$INPUT_SRC" || true
+PANEL_PASS="${INPUT_PASS:-$RANDOM_PASS}"
+
+echo "------------------------------------------"
+echo "已设定管理员账号: ${PANEL_USER}"
+echo "已设定管理员密码: ${PANEL_PASS}"
+echo "=========================================="
+# ----------------------------------------------------
 
 ARCH=$(uname -m)
 case "$ARCH" in
@@ -132,7 +158,7 @@ systemctl stop s-ui
 DB_FILE="$INSTALL_DIR/db/s-ui.db"
 IP=$(curl -4 -fsSL --max-time 5 https://api.ipify.org || curl -4 -fsSL --max-time 5 https://ifconfig.me || echo "127.0.0.1")
 
-# 7. Python 精准写入对齐官方架构的二进制 BLOB
+# 7. Python 注入严格适配的 BLOB 二进制配置
 python3 - <<PYEOF
 import sqlite3
 import json
@@ -207,7 +233,7 @@ cur.execute("INSERT INTO tls (name, server, client) VALUES (?, ?, ?)",
             ('二', to_blob(tls_server_2), to_blob(tls_client_2)))
 tls_2_id = cur.lastrowid
 
-# Inbounds 表 (tag 1: VLESS, tag 2: TUIC)
+# Inbounds 表
 cur.execute("DELETE FROM inbounds WHERE tag IN ('1', '2')")
 
 inbound_1_options = {
@@ -273,7 +299,7 @@ PYEOF
 
 rm -rf "$CERT_DIR"
 
-# 8. 启动服务与放行端口
+# 8. 启动服务与防火墙放行
 systemctl enable s-ui >/dev/null 2>&1
 systemctl restart s-ui
 
