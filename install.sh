@@ -156,7 +156,7 @@ systemctl stop s-ui
 DB_FILE="$INSTALL_DIR/db/s-ui.db"
 IP=$(curl -4 -fsSL --max-time 5 https://api.ipify.org || curl -4 -fsSL --max-time 5 https://ifconfig.me || echo "127.0.0.1")
 
-# 7. Python 写入与官方标准严格一致的 BLOB 结构
+# 7. Python 写入与正常真机 100% 对齐的二进制 BLOB
 python3 - <<PYEOF
 import sqlite3
 import json
@@ -231,7 +231,7 @@ cur.execute("INSERT INTO tls (name, server, client) VALUES (?, ?, ?)",
             ('二', to_blob(tls_server_2), to_blob(tls_client_2)))
 tls_2_id = cur.lastrowid
 
-# 2. Inbounds 表 (补全 out_json 字节流，杜绝 Go 反序列化崩溃)
+# 2. Inbounds 表
 cur.execute("DELETE FROM inbounds WHERE tag IN ('1', '2')")
 
 inbound_1_options = {
@@ -257,7 +257,7 @@ cur.execute("""
 """, ('tuic', '2', tls_2_id, to_blob([]), to_blob(inbound_2_options), to_blob({})))
 inbound_2_id = cur.lastrowid
 
-# 3. Clients 表
+# 3. Clients 表 (name 固定为 My)
 cur.execute("DELETE FROM clients WHERE name='My'")
 
 client_name = "My"
@@ -278,7 +278,6 @@ full_config = {
     "vmess": {"alterId": 0, "name": client_name, "uuid": client_uuid}
 }
 
-# 严格匹配 s-ui 官方 URI 结构
 vless_uri = f"vless://{client_uuid}@$IP:443?type=tcp&security=reality&pbk={reality_pub}&sid={short_id}&fp=chrome&sni=$BEST_SNI&flow=xtls-rprx-vision#%E4%B8%80"
 tuic_uri = f"tuic://{client_uuid}:{client_pass}@$IP:443?security=tls&insecure=1&pcs=$CERT_PUBKEY_HEX&sni=$BEST_SNI&alpn=h3,h2,http/1.1&congestion_control=bbr#%E4%BA%8C"
 
@@ -291,9 +290,6 @@ cur.execute("""
     INSERT INTO clients (enable, name, config, inbounds, links, created_at)
     VALUES (?, ?, ?, ?, ?, ?)
 """, (1, client_name, to_blob(full_config), to_blob([inbound_1_id, inbound_2_id]), to_blob(client_links), int(time.time())))
-
-# 4. Settings 确保开启 Clash 转换宽松支持
-cur.execute("INSERT OR REPLACE INTO settings (key, value) VALUES ('subClashSprtAll', 'true')")
 
 conn.commit()
 conn.close()
@@ -318,10 +314,9 @@ elif command -v firewall-cmd >/dev/null 2>&1; then
     firewall-cmd --reload >/dev/null 2>&1 || true
 fi
 
-# 9. 兼容 Python 解析 UUID 并输出链接
-CLIENT_UUID=$(python3 -c "import sqlite3, json; conn=sqlite3.connect('$DB_FILE'); cur=conn.cursor(); cur.execute('SELECT config FROM clients WHERE name=\"My\"'); print(json.loads(cur.fetchone()[0].decode('utf-8'))['vless']['uuid'])" 2>/dev/null || echo "My")
-SUB_URL_RAW="http://${IP}:${SUB_PORT}/sub/${CLIENT_UUID}"
-SUB_URL_CLASH="http://${IP}:${SUB_PORT}/sub/${CLIENT_UUID}?format=clash"
+# 9. 直接使用用户名 My 作为订阅路径
+SUB_URL_RAW="http://${IP}:${SUB_PORT}/sub/My"
+SUB_URL_CLASH="http://${IP}:${SUB_PORT}/sub/My?format=clash"
 
 echo ""
 echo "==================== 部署与配置完成 ===================="
