@@ -102,7 +102,7 @@ EOF
 
 systemctl daemon-reload
 
-# 4. 首次拉起初始化数据库并配置管理员账密
+# 4. 首次启动初始化数据库并设定管理员
 systemctl restart s-ui
 sleep 2
 echo "==> 正在配置面板管理员账号与密码..."
@@ -156,7 +156,7 @@ systemctl stop s-ui
 DB_FILE="$INSTALL_DIR/db/s-ui.db"
 IP=$(curl -4 -fsSL --max-time 5 https://api.ipify.org || curl -4 -fsSL --max-time 5 https://ifconfig.me || echo "127.0.0.1")
 
-# 7. Python 写入与正常真机 100% 对齐的二进制 BLOB
+# 7. Python 精准写入对齐官方架构的二进制 BLOB
 python3 - <<PYEOF
 import sqlite3
 import json
@@ -178,7 +178,7 @@ with open("$CERT_DIR/self.crt", "r") as f:
 
 reality_priv = secrets.token_urlsafe(32)[:43]
 reality_pub = secrets.token_urlsafe(32)[:43]
-short_id = secrets.token_hex(4)
+short_id = secrets.token_hex(3)
 
 client_uuid = str(uuid.uuid4())
 client_pass = secrets.token_urlsafe(8)[:8]
@@ -197,7 +197,7 @@ tls_server_1 = {
             "server_port": 443
         },
         "private_key": reality_priv,
-        "short_id": ["", short_id]
+        "short_id": [short_id]
     },
     "server_name": "$BEST_SNI"
 }
@@ -223,41 +223,71 @@ tls_client_2 = {
     "insecure": True
 }
 
-cur.execute("INSERT INTO tls (name, server, client) VALUES (?, ?, ?)",
-            ('一', to_blob(tls_server_1), to_blob(tls_client_1)))
-tls_1_id = cur.lastrowid
+cur.execute("INSERT INTO tls (id, name, server, client) VALUES (1, '一', ?, ?)",
+            (to_blob(tls_server_1), to_blob(tls_client_1)))
+cur.execute("INSERT INTO tls (id, name, server, client) VALUES (2, '二', ?, ?)",
+            (to_blob(tls_server_2), to_blob(tls_client_2)))
 
-cur.execute("INSERT INTO tls (name, server, client) VALUES (?, ?, ?)",
-            ('二', to_blob(tls_server_2), to_blob(tls_client_2)))
-tls_2_id = cur.lastrowid
+# 2. Inbounds 表 (带齐完整的 out_json 模板，保证 Clash 动态渲染)
+cur.execute("DELETE FROM inbounds WHERE id IN (1, 2)")
 
-# 2. Inbounds 表
-cur.execute("DELETE FROM inbounds WHERE tag IN ('1', '2')")
-
-inbound_1_options = {
+vless_options = {
     "listen": "::",
     "listen_port": 443,
     "transport": {}
 }
-inbound_2_options = {
+tuic_options = {
     "congestion_control": "bbr",
     "listen": "::",
     "listen_port": 443
 }
 
-cur.execute("""
-    INSERT INTO inbounds (type, tag, tls_id, addrs, options, out_json)
-    VALUES (?, ?, ?, ?, ?, ?)
-""", ('vless', '1', tls_1_id, to_blob([]), to_blob(inbound_1_options), to_blob({})))
-inbound_1_id = cur.lastrowid
+vless_out_json = {
+    "server": "$IP",
+    "server_port": 443,
+    "tag": "My1",
+    "tls": {
+        "enabled": True,
+        "reality": {
+            "enabled": True,
+            "public_key": reality_pub,
+            "short_id": short_id
+        },
+        "server_name": "$BEST_SNI",
+        "utls": {
+            "enabled": True,
+            "fingerprint": "chrome"
+        }
+    },
+    "transport": {},
+    "type": "vless"
+}
+
+tuic_out_json = {
+    "congestion_control": "bbr",
+    "server": "$IP",
+    "server_port": 443,
+    "tag": "My2",
+    "tls": {
+        "alpn": ["h3"],
+        "enabled": True,
+        "insecure": True,
+        "server_name": "$BEST_SNI"
+    },
+    "type": "tuic"
+}
 
 cur.execute("""
-    INSERT INTO inbounds (type, tag, tls_id, addrs, options, out_json)
-    VALUES (?, ?, ?, ?, ?, ?)
-""", ('tuic', '2', tls_2_id, to_blob([]), to_blob(inbound_2_options), to_blob({})))
-inbound_2_id = cur.lastrowid
+    INSERT INTO inbounds (id, type, tag, tls_id, addrs, options, out_json)
+    VALUES (1, 'vless', 'My1', 1, ?, ?, ?)
+""", (to_blob([]), to_blob(vless_options), to_blob(vless_out_json)))
 
-# 3. Clients 表 (name 固定为 My)
+cur.execute("""
+    INSERT INTO inbounds (id, type, tag, tls_id, addrs, options, out_json)
+    VALUES (2, 'tuic', 'My2', 2, ?, ?, ?)
+""", (to_blob([]), to_blob(tuic_options), to_blob(tuic_out_json)))
+
+# 3. Clients 表
 cur.execute("DELETE FROM clients WHERE name='My'")
 
 client_name = "My"
@@ -278,18 +308,18 @@ full_config = {
     "vmess": {"alterId": 0, "name": client_name, "uuid": client_uuid}
 }
 
-vless_uri = f"vless://{client_uuid}@$IP:443?type=tcp&security=reality&pbk={reality_pub}&sid={short_id}&fp=chrome&sni=$BEST_SNI&flow=xtls-rprx-vision#%E4%B8%80"
-tuic_uri = f"tuic://{client_uuid}:{client_pass}@$IP:443?security=tls&insecure=1&pcs=$CERT_PUBKEY_HEX&sni=$BEST_SNI&alpn=h3,h2,http/1.1&congestion_control=bbr#%E4%BA%8C"
+vless_uri = f"vless://{client_uuid}@$IP:443?type=tcp&security=reality&pbk={reality_pub}&sid={short_id}&fp=chrome&sni=$BEST_SNI&flow=xtls-rprx-vision#My1"
+tuic_uri = f"tuic://{client_uuid}:{client_pass}@$IP:443?security=tls&insecure=1&pcs=$CERT_PUBKEY_HEX&sni=$BEST_SNI&alpn=h3,h2,http/1.1&congestion_control=bbr#My2"
 
 client_links = [
-    {"remark": "一", "type": "local", "uri": vless_uri},
-    {"remark": "二", "type": "local", "uri": tuic_uri}
+    {"remark": "My1", "type": "local", "uri": vless_uri},
+    {"remark": "My2", "type": "local", "uri": tuic_uri}
 ]
 
 cur.execute("""
     INSERT INTO clients (enable, name, config, inbounds, links, created_at)
     VALUES (?, ?, ?, ?, ?, ?)
-""", (1, client_name, to_blob(full_config), to_blob([inbound_1_id, inbound_2_id]), to_blob(client_links), int(time.time())))
+""", (1, client_name, to_blob(full_config), to_blob([1, 2]), to_blob(client_links), int(time.time())))
 
 conn.commit()
 conn.close()
@@ -314,7 +344,7 @@ elif command -v firewall-cmd >/dev/null 2>&1; then
     firewall-cmd --reload >/dev/null 2>&1 || true
 fi
 
-# 9. 直接使用用户名 My 作为订阅路径
+# 9. 输出通用订阅及专用 Clash 订阅链接
 SUB_URL_RAW="http://${IP}:${SUB_PORT}/sub/My"
 SUB_URL_CLASH="http://${IP}:${SUB_PORT}/sub/My?format=clash"
 
