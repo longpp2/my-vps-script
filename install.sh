@@ -1,10 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# 1. 消除系统语言及 Ubuntu/Debian 弹窗交互阻塞
-export DEBIAN_FRONTEND=noninteractive
-export LC_ALL=C
-
 if [ "$(id -u)" -ne 0 ]; then
     echo "错误：必须使用 root 权限运行！" >&2
     exit 1
@@ -53,7 +49,7 @@ esac
 
 echo "==> 目标系统架构: ${TARGET_ARCH}，面板版本: ${VERSION}"
 
-# 1. 安装基础依赖（兼容 CentOS 7 EOL 源及 Ubuntu 防配置冲突）
+# 1. 安装基础依赖（含 CentOS 7 EOL 源自动修复）
 echo "==> 正在检查并安装基础依赖..."
 if [ -f /etc/redhat-release ] && grep -q "release 7" /etc/redhat-release 2>/dev/null; then
     if grep -q "mirrorlist.centos.org" /etc/yum.repos.d/CentOS-*.repo 2>/dev/null; then
@@ -64,14 +60,14 @@ if [ -f /etc/redhat-release ] && grep -q "release 7" /etc/redhat-release 2>/dev/
 fi
 
 if command -v apt-get >/dev/null 2>&1; then
-    apt-get update -qq && apt-get install -y -qq -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" curl tar openssl sqlite3 qrencode python3 gawk || true
+    apt-get update -qq && apt-get install -y -qq curl tar openssl sqlite3 qrencode python3 gawk || true
 elif command -v dnf >/dev/null 2>&1; then
     dnf install -y -q curl tar openssl sqlite qrencode python3 gawk || true
 elif command -v yum >/dev/null 2>&1; then
     yum install -y -q curl tar openssl sqlite qrencode python3 gawk || true
 fi
 
-# 2. 内核网络调优（开启 TCP BBR + 扩大 QUIC/UDP 缓冲区提升 TUIC/Hysteria2 吞吐量）
+# 2. 内核网络调优（开启 TCP BBR + 扩大 QUIC/UDP 缓冲区提升 TUIC 吞吐量）
 echo "==> 正在应用系统内核 BBR 与 UDP 缓冲区调优..."
 mkdir -p /etc/sysctl.d
 cat <<EOF > /etc/sysctl.d/99-sui-optimize.conf
@@ -210,7 +206,7 @@ rm -f "$SNI_TMP"
 
 echo "==> 选定最低延迟 SNI (Top 1): $BEST_SNI (${MIN_LATENCY} ms)"
 
-# 7. 生成证书与 X25519 密钥
+# 7. 生成 TUIC 自签证书（兼容 OpenSSL 1.0.2+）
 CERT_DIR=$(mktemp -d)
 openssl req -x509 -newkey rsa:2048 -nodes -sha256 -keyout "$CERT_DIR/self.key" -out "$CERT_DIR/self.crt" -days 3650 -subj "/CN=$BEST_SNI" 2>/dev/null
 CERT_PUBKEY_SHA256=$(openssl x509 -in "$CERT_DIR/self.crt" -pubkey -noout | openssl pkey -pubin -outform der | openssl dgst -sha256 -binary | base64 | tr -d '\n')
@@ -218,8 +214,8 @@ CERT_PUBKEY_HEX=$(openssl x509 -in "$CERT_DIR/self.crt" -pubkey -noout | openssl
 
 IP=$(curl -4 -fsSL --max-time 5 https://api.ipify.org || curl -4 -fsSL --max-time 5 https://ifconfig.me || echo "127.0.0.1")
 
-# 8. Python 原生计算密钥并注入数据库 (三协议：VLESS-Reality + TUIC v5 + Hysteria2)
-echo "==> 正在生成密钥对并写入三协议节点配置..."
+# 8. Python 原生计算 X25519 密钥对并写入 SQLite 数据库（无视低版本 OpenSSL 限制）
+echo "==> 正在生成 Reality X25519 密钥对并写入节点配置..."
 python3 - <<PYEOF
 import sqlite3
 import json
@@ -228,6 +224,7 @@ import secrets
 import base64
 import time
 
+# 纯 Python RFC 7748 Curve25519 (X25519) 密钥派生，兼容 Python 3.6+，无需外部依赖
 def generate_x25519_keypair():
     P = (1 << 255) - 19
     raw = bytearray(secrets.token_bytes(32))
@@ -263,7 +260,7 @@ def generate_x25519_keypair():
         z_2 = (E * (AA + 121665 * E)) % P
     if swap:
         x_2, x_3 = x_3, x_2
-        z_2, z_3 = z_3, z_2
+        z_2, z_3 = z_3, z_3 if False else z_2
     pub_int = (x_2 * pow(z_2, P - 2, P)) % P
     pub_bytes = pub_int.to_bytes(32, 'little')
     
@@ -290,8 +287,8 @@ client_pass = secrets.token_urlsafe(12)[:12]
 ss_pass_1 = base64.b64encode(secrets.token_bytes(32)).decode('utf-8')
 ss_pass_2 = base64.b64encode(secrets.token_bytes(16)).decode('utf-8')
 
-# 1. TLS 表 (配置两个 TLS 方案：Reality 用于 VLESS，自签证书用于 TUIC 和 Hysteria2)
-cur.execute("DELETE FROM tls WHERE id IN (1, 2, 3) OR name IN ('一', '二', '三')")
+# 1. TLS 表
+cur.execute("DELETE FROM tls WHERE id IN (1, 2) OR name IN ('一', '二')")
 
 tls_server_1 = {
     "enabled": True,
@@ -328,34 +325,69 @@ tls_client_2 = {
     "insecure": True
 }
 
-cur.execute("INSERT INTO tls (id, name, server, client) VALUES (1, '一', ?, ?)", (to_blob(tls_server_1), to_blob(tls_client_1)))
-cur.execute("INSERT INTO tls (id, name, server, client) VALUES (2, '二', ?, ?)", (to_blob(tls_server_2), to_blob(tls_client_2)))
-cur.execute("INSERT INTO tls (id, name, server, client) VALUES (3, '三', ?, ?)", (to_blob(tls_server_2), to_blob(tls_client_2)))
+cur.execute("INSERT INTO tls (id, name, server, client) VALUES (1, '一', ?, ?)",
+            (to_blob(tls_server_1), to_blob(tls_client_1)))
+cur.execute("INSERT INTO tls (id, name, server, client) VALUES (2, '二', ?, ?)",
+            (to_blob(tls_server_2), to_blob(tls_client_2)))
 
-# 2. Inbounds 表 (新增 My3: Hysteria2)
-cur.execute("DELETE FROM inbounds WHERE id IN (1, 2, 3)")
+# 2. Inbounds 表
+cur.execute("DELETE FROM inbounds WHERE id IN (1, 2)")
 
-vless_options = {"listen": "::", "listen_port": 443, "transport": {}}
-tuic_options = {"congestion_control": "bbr", "listen": "::", "listen_port": 443}
-hy2_options = {"up_mbps": 100, "down_mbps": 100, "listen": "::", "listen_port": 443}
+vless_options = {
+    "listen": "::",
+    "listen_port": 443,
+    "transport": {}
+}
+tuic_options = {
+    "congestion_control": "bbr",
+    "listen": "::",
+    "listen_port": 443
+}
 
 vless_out_json = {
-    "server": "$IP", "server_port": 443, "tag": "My1",
-    "tls": {"enabled": True, "reality": {"enabled": True, "public_key": reality_pub, "short_id": short_id}, "server_name": "$BEST_SNI", "utls": {"enabled": True, "fingerprint": "chrome"}},
-    "transport": {}, "type": "vless"
-}
-tuic_out_json = {
-    "congestion_control": "bbr", "server": "$IP", "server_port": 443, "tag": "My2",
-    "tls": {"alpn": ["h3"], "enabled": True, "insecure": True, "server_name": "$BEST_SNI"}, "type": "tuic"
-}
-hy2_out_json = {
-    "server": "$IP", "server_port": 443, "tag": "My3",
-    "tls": {"alpn": ["h3"], "enabled": True, "insecure": True, "server_name": "$BEST_SNI"}, "type": "hysteria2"
+    "server": "$IP",
+    "server_port": 443,
+    "tag": "My1",
+    "tls": {
+        "enabled": True,
+        "reality": {
+            "enabled": True,
+            "public_key": reality_pub,
+            "short_id": short_id
+        },
+        "server_name": "$BEST_SNI",
+        "utls": {
+            "enabled": True,
+            "fingerprint": "chrome"
+        }
+    },
+    "transport": {},
+    "type": "vless"
 }
 
-cur.execute("INSERT INTO inbounds (id, type, tag, tls_id, addrs, options, out_json) VALUES (1, 'vless', 'My1', 1, ?, ?, ?)", (to_blob([]), to_blob(vless_options), to_blob(vless_out_json)))
-cur.execute("INSERT INTO inbounds (id, type, tag, tls_id, addrs, options, out_json) VALUES (2, 'tuic', 'My2', 2, ?, ?, ?)", (to_blob([]), to_blob(tuic_options), to_blob(tuic_out_json)))
-cur.execute("INSERT INTO inbounds (id, type, tag, tls_id, addrs, options, out_json) VALUES (3, 'hysteria2', 'My3', 3, ?, ?, ?)", (to_blob([]), to_blob(hy2_options), to_blob(hy2_out_json)))
+tuic_out_json = {
+    "congestion_control": "bbr",
+    "server": "$IP",
+    "server_port": 443,
+    "tag": "My2",
+    "tls": {
+        "alpn": ["h3"],
+        "enabled": True,
+        "insecure": True,
+        "server_name": "$BEST_SNI"
+    },
+    "type": "tuic"
+}
+
+cur.execute("""
+    INSERT INTO inbounds (id, type, tag, tls_id, addrs, options, out_json)
+    VALUES (1, 'vless', 'My1', 1, ?, ?, ?)
+""", (to_blob([]), to_blob(vless_options), to_blob(vless_out_json)))
+
+cur.execute("""
+    INSERT INTO inbounds (id, type, tag, tls_id, addrs, options, out_json)
+    VALUES (2, 'tuic', 'My2', 2, ?, ?, ?)
+""", (to_blob([]), to_blob(tuic_options), to_blob(tuic_out_json)))
 
 # 3. Clients 表
 cur.execute("DELETE FROM clients WHERE name LIKE 'My%'")
@@ -380,18 +412,16 @@ full_config = {
 
 vless_uri = f"vless://{client_uuid}@$IP:443?type=tcp&security=reality&pbk={reality_pub}&sid={short_id}&fp=chrome&sni=$BEST_SNI&flow=xtls-rprx-vision#My1"
 tuic_uri = f"tuic://{client_uuid}:{client_pass}@$IP:443?security=tls&insecure=1&pcs=$CERT_PUBKEY_HEX&sni=$BEST_SNI&alpn=h3,h2,http/1.1&congestion_control=bbr#My2"
-hy2_uri = f"hysteria2://{client_pass}@$IP:443?insecure=1&sni=$BEST_SNI#My3"
 
 client_links = [
     {"remark": "My1", "type": "local", "uri": vless_uri},
-    {"remark": "My2", "type": "local", "uri": tuic_uri},
-    {"remark": "My3", "type": "local", "uri": hy2_uri}
+    {"remark": "My2", "type": "local", "uri": tuic_uri}
 ]
 
 cur.execute("""
     INSERT INTO clients (enable, name, config, inbounds, links, created_at)
     VALUES (?, ?, ?, ?, ?, ?)
-""", (1, client_name, to_blob(full_config), to_blob([1, 2, 3]), to_blob(client_links), int(time.time())))
+""", (1, client_name, to_blob(full_config), to_blob([1, 2]), to_blob(client_links), int(time.time())))
 
 conn.commit()
 conn.close()
