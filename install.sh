@@ -18,7 +18,6 @@ echo "=========================================="
 
 RANDOM_USER="admin_$(openssl rand -hex 3)"
 RANDOM_PASS=$(openssl rand -base64 12 | tr -d '=+/' | cut -c1-12)
-# 生成随机订阅路径后缀，防止被扫描器枚举 /sub/My 盗刷流量
 SUB_TOKEN="My_$(openssl rand -hex 4)"
 
 if [ -t 0 ]; then
@@ -50,8 +49,16 @@ esac
 
 echo "==> 目标系统架构: ${TARGET_ARCH}，面板版本: ${VERSION}"
 
-# 1. 安装基础依赖
+# 1. 安装基础依赖（含 CentOS 7 EOL 源自动修复）
 echo "==> 正在检查并安装基础依赖..."
+if [ -f /etc/redhat-release ] && grep -q "release 7" /etc/redhat-release 2>/dev/null; then
+    if grep -q "mirrorlist.centos.org" /etc/yum.repos.d/CentOS-*.repo 2>/dev/null; then
+        echo "==> 检测到 CentOS 7 官方源已停服，正在自动切换至 vault.centos.org 归档源..."
+        sed -i 's/mirrorlist/#mirrorlist/g' /etc/yum.repos.d/CentOS-*.repo || true
+        sed -i 's|#baseurl=http://mirror.centos.org|baseurl=http://vault.centos.org|g' /etc/yum.repos.d/CentOS-*.repo || true
+    fi
+fi
+
 if command -v apt-get >/dev/null 2>&1; then
     apt-get update -qq && apt-get install -y -qq curl tar openssl sqlite3 qrencode python3 gawk || true
 elif command -v dnf >/dev/null 2>&1; then
@@ -62,6 +69,7 @@ fi
 
 # 2. 内核网络调优（开启 TCP BBR + 扩大 QUIC/UDP 缓冲区提升 TUIC 吞吐量）
 echo "==> 正在应用系统内核 BBR 与 UDP 缓冲区调优..."
+mkdir -p /etc/sysctl.d
 cat <<EOF > /etc/sysctl.d/99-sui-optimize.conf
 net.core.default_qdisc = fq
 net.ipv4.tcp_congestion_control = bbr
@@ -70,7 +78,7 @@ net.core.wmem_max = 26214400
 net.core.rmem_default = 26214400
 net.core.wmem_default = 26214400
 EOF
-sysctl --system >/dev/null 2>&1 || true
+sysctl --system >/dev/null 2>&1 || sysctl -p /etc/sysctl.d/99-sui-optimize.conf >/dev/null 2>&1 || true
 
 # 3. 下载并解压安装
 rm -rf "$INSTALL_DIR"
@@ -120,7 +128,7 @@ EOF
 
 systemctl daemon-reload
 
-# 5. 首次启动初始化数据库并离线设定管理员（消除 SQLite 锁冲突）
+# 5. 首次启动初始化数据库并离线设定管理员
 echo "==> 正在初始化数据库并配置管理员凭据..."
 systemctl restart s-ui
 
@@ -136,8 +144,8 @@ done
 systemctl stop s-ui
 (cd "$INSTALL_DIR" && ./sui admin -username "$PANEL_USER" -password "$PANEL_PASS")
 
-# 6. 并发去重 SNI 握手测速（强制校验 TLS 1.3 + HTTP/2，剔除 DNS 解析耗时）
-echo "==> 正在对候选 SNI 域名执行并发 TLS 1.3 净握手测速..."
+# 6. 并发去重 SNI 握手测速（自适应旧版 curl，剔除 DNS 耗时）
+echo "==> 正在对候选 SNI 域名执行并发 TLS 净握手测速..."
 DOMAINS=(
     "amd.com" "d.impactradius-event.com" "t0.m.awsstatic.com" "acctcdn.msftauth.net" "www.oracle.com"
     "lpcdn.lpsnmedia.net" "cdn-dynmedia-1.microsoft.com" "ms-vscode.gallerycdn.vsassets.io" "aws.com" "intel.com"
@@ -160,21 +168,24 @@ BEST_SNI="d.oracleinfinity.io"
 MIN_LATENCY=99999
 SNI_TMP=$(mktemp)
 
-CURL_H2_FLAG=""
-if curl --help all 2>&1 | grep -q -- "--http2"; then
-    CURL_H2_FLAG="--http2"
+CURL_EXTRA_FLAGS=""
+if (curl --help all 2>&1 || curl --help 2>&1) | grep -q -- "--tlsv1.3"; then
+    CURL_EXTRA_FLAGS="$CURL_EXTRA_FLAGS --tlsv1.3"
+fi
+if (curl --help all 2>&1 || curl --help 2>&1) | grep -q -- "--http2"; then
+    CURL_EXTRA_FLAGS="$CURL_EXTRA_FLAGS --http2"
 fi
 
 for d in "${UNIQUE_DOMAINS[@]}"; do
     (
-        res=$(curl -o /dev/null -s -w "%{time_namelookup} %{time_appconnect}" --connect-timeout 1 --max-time 2 --tlsv1.3 $CURL_H2_FLAG "https://$d" 2>/dev/null || true)
+        res=$(curl -o /dev/null -s -w "%{time_namelookup} %{time_appconnect}" --connect-timeout 1 --max-time 2 $CURL_EXTRA_FLAGS "https://$d" 2>/dev/null || true)
         if [ -n "$res" ]; then
             lat=$(echo "$res" | awk '{
                 diff = ($2 - $1) * 1000;
                 if ($2 > 0 && diff > 0) printf "%d", diff;
                 else print 0;
             }')
-            if [ "$lat" -gt 0 ] 2>/dev/null; then
+            if [ "${lat:-0}" -gt 0 ] 2>/dev/null; then
                 echo "${lat} ${d}" >> "$SNI_TMP"
             fi
         fi
@@ -183,10 +194,11 @@ done
 wait
 
 if [ -s "$SNI_TMP" ]; then
+    SORTED_SNI=$(sort -n "$SNI_TMP")
     while read -r lat dom; do
-        echo "  - ${dom}: ${lat} ms"
-    done < <(sort -n "$SNI_TMP" | head -n 10)
-    BEST_LINE=$(sort -n "$SNI_TMP" | head -n 1)
+        [ -n "$dom" ] && echo "  - ${dom}: ${lat} ms"
+    done <<< "$(echo "$SORTED_SNI" | sed -n '1,10p')"
+    BEST_LINE=$(echo "$SORTED_SNI" | sed -n '1p')
     MIN_LATENCY=$(echo "$BEST_LINE" | awk '{print $1}')
     BEST_SNI=$(echo "$BEST_LINE" | awk '{print $2}')
 fi
@@ -194,20 +206,16 @@ rm -f "$SNI_TMP"
 
 echo "==> 选定最低延迟 SNI (Top 1): $BEST_SNI (${MIN_LATENCY} ms)"
 
-# 7. 生成配对的 X25519 Reality 密钥与 TUIC 自签证书
+# 7. 生成 TUIC 自签证书（兼容 OpenSSL 1.0.2+）
 CERT_DIR=$(mktemp -d)
 openssl req -x509 -newkey rsa:2048 -nodes -sha256 -keyout "$CERT_DIR/self.key" -out "$CERT_DIR/self.crt" -days 3650 -subj "/CN=$BEST_SNI" 2>/dev/null
-CERT_PUBKEY_SHA256=$(openssl x509 -in "$CERT_DIR/self.crt" -pubkey -noout | openssl pkey -pubin -outform der | openssl dgst -sha256 -binary | base64)
-CERT_PUBKEY_HEX=$(openssl x509 -in "$CERT_DIR/self.crt" -pubkey -noout | openssl pkey -pubin -outform der | openssl dgst -sha256 -hex | awk '{print $2}')
-
-# 使用 OpenSSL 生成数学配对的 X25519 私钥与公钥（URL-safe Base64 无填充格式）
-X25519_KEY=$(openssl genpkey -algorithm X25519 2>/dev/null)
-REALITY_PRIV=$(echo "$X25519_KEY" | openssl pkey -outform DER | tail -c 32 | base64 | tr -d '\n=' | tr '+/' '-_')
-REALITY_PUB=$(echo "$X25519_KEY" | openssl pkey -pubout -outform DER | tail -c 32 | base64 | tr -d '\n=' | tr '+/' '-_')
+CERT_PUBKEY_SHA256=$(openssl x509 -in "$CERT_DIR/self.crt" -pubkey -noout | openssl pkey -pubin -outform der | openssl dgst -sha256 -binary | base64 | tr -d '\n')
+CERT_PUBKEY_HEX=$(openssl x509 -in "$CERT_DIR/self.crt" -pubkey -noout | openssl pkey -pubin -outform der | openssl dgst -sha256 -hex | awk '{print $NF}')
 
 IP=$(curl -4 -fsSL --max-time 5 https://api.ipify.org || curl -4 -fsSL --max-time 5 https://ifconfig.me || echo "127.0.0.1")
 
-# 8. Python 精准写入对齐官方架构的二进制 BLOB
+# 8. Python 原生计算 X25519 密钥对并写入 SQLite 数据库（无视低版本 OpenSSL 限制）
+echo "==> 正在生成 Reality X25519 密钥对并写入节点配置..."
 python3 - <<PYEOF
 import sqlite3
 import json
@@ -215,6 +223,50 @@ import uuid
 import secrets
 import base64
 import time
+
+# 纯 Python RFC 7748 Curve25519 (X25519) 密钥派生，兼容 Python 3.6+，无需外部依赖
+def generate_x25519_keypair():
+    P = (1 << 255) - 19
+    raw = bytearray(secrets.token_bytes(32))
+    raw[0] &= 248
+    raw[31] &= 127
+    raw[31] |= 64
+    priv_bytes = bytes(raw)
+    n = int.from_bytes(priv_bytes, 'little')
+    
+    x_1 = 9
+    x_2, z_2 = 1, 0
+    x_3, z_3 = x_1, 1
+    swap = 0
+    for t in range(254, -1, -1):
+        k_t = (n >> t) & 1
+        swap ^= k_t
+        if swap:
+            x_2, x_3 = x_3, x_2
+            z_2, z_3 = z_3, z_2
+        swap = k_t
+        A = (x_2 + z_2) % P
+        AA = (A * A) % P
+        B = (x_2 - z_2) % P
+        BB = (B * B) % P
+        E = (AA - BB) % P
+        C = (x_3 + z_3) % P
+        D = (x_3 - z_3) % P
+        DA = (D * A) % P
+        CB = (C * B) % P
+        x_3 = pow(DA + CB, 2, P)
+        z_3 = (x_1 * pow(DA - CB, 2, P)) % P
+        x_2 = (AA * BB) % P
+        z_2 = (E * (AA + 121665 * E)) % P
+    if swap:
+        x_2, x_3 = x_3, x_2
+        z_2, z_3 = z_3, z_3 if False else z_2
+    pub_int = (x_2 * pow(z_2, P - 2, P)) % P
+    pub_bytes = pub_int.to_bytes(32, 'little')
+    
+    priv_b64 = base64.urlsafe_b64encode(priv_bytes).decode('utf-8').rstrip('=')
+    pub_b64 = base64.urlsafe_b64encode(pub_bytes).decode('utf-8').rstrip('=')
+    return priv_b64, pub_b64
 
 def to_blob(data):
     return sqlite3.Binary(json.dumps(data, indent=2, ensure_ascii=False).encode('utf-8'))
@@ -227,8 +279,7 @@ with open("$CERT_DIR/self.key", "r") as f:
 with open("$CERT_DIR/self.crt", "r") as f:
     crt_lines = [line.strip() for line in f if line.strip()]
 
-reality_priv = "$REALITY_PRIV"
-reality_pub = "$REALITY_PUB"
+reality_priv, reality_pub = generate_x25519_keypair()
 short_id = secrets.token_hex(4)
 
 client_uuid = str(uuid.uuid4())
@@ -279,7 +330,7 @@ cur.execute("INSERT INTO tls (id, name, server, client) VALUES (1, '一', ?, ?)"
 cur.execute("INSERT INTO tls (id, name, server, client) VALUES (2, '二', ?, ?)",
             (to_blob(tls_server_2), to_blob(tls_client_2)))
 
-# 2. Inbounds 表 (带齐完整的 out_json 模板，保证 Clash 动态渲染)
+# 2. Inbounds 表
 cur.execute("DELETE FROM inbounds WHERE id IN (1, 2)")
 
 vless_options = {
