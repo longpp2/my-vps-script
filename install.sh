@@ -18,6 +18,8 @@ echo "=========================================="
 
 RANDOM_USER="admin_$(openssl rand -hex 3)"
 RANDOM_PASS=$(openssl rand -base64 12 | tr -d '=+/' | cut -c1-12)
+# 生成随机订阅路径后缀，防止被扫描器枚举 /sub/My 盗刷流量
+SUB_TOKEN="My_$(openssl rand -hex 4)"
 
 if [ -t 0 ]; then
     INPUT_SRC="/dev/stdin"
@@ -34,6 +36,7 @@ PANEL_PASS="${INPUT_PASS:-$RANDOM_PASS}"
 echo "------------------------------------------"
 echo "已设定管理员账号: ${PANEL_USER}"
 echo "已设定管理员密码: ${PANEL_PASS}"
+echo "已生成防扫订阅号: ${SUB_TOKEN}"
 echo "=========================================="
 # ----------------------------------------------------
 
@@ -48,13 +51,28 @@ esac
 echo "==> 目标系统架构: ${TARGET_ARCH}，面板版本: ${VERSION}"
 
 # 1. 安装基础依赖
+echo "==> 正在检查并安装基础依赖..."
 if command -v apt-get >/dev/null 2>&1; then
-    apt-get update -qq && apt-get install -y -qq curl tar openssl sqlite3 qrencode python3 || true
+    apt-get update -qq && apt-get install -y -qq curl tar openssl sqlite3 qrencode python3 gawk || true
+elif command -v dnf >/dev/null 2>&1; then
+    dnf install -y -q curl tar openssl sqlite qrencode python3 gawk || true
 elif command -v yum >/dev/null 2>&1; then
-    yum install -y -q curl tar openssl sqlite qrencode python3 || true
+    yum install -y -q curl tar openssl sqlite qrencode python3 gawk || true
 fi
 
-# 2. 下载并解压安装
+# 2. 内核网络调优（开启 TCP BBR + 扩大 QUIC/UDP 缓冲区提升 TUIC 吞吐量）
+echo "==> 正在应用系统内核 BBR 与 UDP 缓冲区调优..."
+cat <<EOF > /etc/sysctl.d/99-sui-optimize.conf
+net.core.default_qdisc = fq
+net.ipv4.tcp_congestion_control = bbr
+net.core.rmem_max = 26214400
+net.core.wmem_max = 26214400
+net.core.rmem_default = 26214400
+net.core.wmem_default = 26214400
+EOF
+sysctl --system >/dev/null 2>&1 || true
+
+# 3. 下载并解压安装
 rm -rf "$INSTALL_DIR"
 mkdir -p "$INSTALL_DIR"
 TMP_DIR=$(mktemp -d)
@@ -81,7 +99,7 @@ ln -sf "$INSTALL_DIR/sui" /usr/bin/s-ui
 ln -sf "$INSTALL_DIR/sui" /usr/local/bin/sui
 ln -sf "$INSTALL_DIR/sui" /usr/bin/sui
 
-# 3. 配置 systemd 服务
+# 4. 配置 systemd 服务
 cat <<EOF > /etc/systemd/system/s-ui.service
 [Unit]
 Description=s-ui service
@@ -102,14 +120,24 @@ EOF
 
 systemctl daemon-reload
 
-# 4. 首次启动初始化数据库并设定管理员
+# 5. 首次启动初始化数据库并离线设定管理员（消除 SQLite 锁冲突）
+echo "==> 正在初始化数据库并配置管理员凭据..."
 systemctl restart s-ui
-sleep 2
-echo "==> 正在配置面板管理员账号与密码..."
+
+DB_FILE="$INSTALL_DIR/db/s-ui.db"
+for _ in {1..15}; do
+    if [ -s "$DB_FILE" ]; then
+        sleep 1
+        break
+    fi
+    sleep 1
+done
+
+systemctl stop s-ui
 (cd "$INSTALL_DIR" && ./sui admin -username "$PANEL_USER" -password "$PANEL_PASS")
 
-# 5. 全量去重 SNI 握手测速
-echo "==> 正在对候选 SNI 域名执行 TCP/TLS 握手测速..."
+# 6. 并发去重 SNI 握手测速（强制校验 TLS 1.3 + HTTP/2，剔除 DNS 解析耗时）
+echo "==> 正在对候选 SNI 域名执行并发 TLS 1.3 净握手测速..."
 DOMAINS=(
     "amd.com" "d.impactradius-event.com" "t0.m.awsstatic.com" "acctcdn.msftauth.net" "www.oracle.com"
     "lpcdn.lpsnmedia.net" "cdn-dynmedia-1.microsoft.com" "ms-vscode.gallerycdn.vsassets.io" "aws.com" "intel.com"
@@ -130,33 +158,56 @@ DOMAINS=(
 UNIQUE_DOMAINS=($(printf "%s\n" "${DOMAINS[@]}" | sort -u))
 BEST_SNI="d.oracleinfinity.io"
 MIN_LATENCY=99999
+SNI_TMP=$(mktemp)
+
+CURL_H2_FLAG=""
+if curl --help all 2>&1 | grep -q -- "--http2"; then
+    CURL_H2_FLAG="--http2"
+fi
 
 for d in "${UNIQUE_DOMAINS[@]}"; do
-    t1=$(date +%s%3N)
-    if timeout 1 openssl s_client -connect "$d:443" -servername "$d" </dev/null &>/dev/null; then
-        t2=$(date +%s%3N)
-        lat=$((t2 - t1))
-        echo "  - $d: ${lat} ms"
-        if [ "$lat" -lt "$MIN_LATENCY" ]; then
-            MIN_LATENCY=$lat
-            BEST_SNI=$d
+    (
+        res=$(curl -o /dev/null -s -w "%{time_namelookup} %{time_appconnect}" --connect-timeout 1 --max-time 2 --tlsv1.3 $CURL_H2_FLAG "https://$d" 2>/dev/null || true)
+        if [ -n "$res" ]; then
+            lat=$(echo "$res" | awk '{
+                diff = ($2 - $1) * 1000;
+                if ($2 > 0 && diff > 0) printf "%d", diff;
+                else print 0;
+            }')
+            if [ "$lat" -gt 0 ] 2>/dev/null; then
+                echo "${lat} ${d}" >> "$SNI_TMP"
+            fi
         fi
-    fi
+    ) &
 done
-echo "==> 选定最低延迟 SNI: $BEST_SNI (${MIN_LATENCY} ms)"
+wait
 
-# 6. 生成证书和密钥
+if [ -s "$SNI_TMP" ]; then
+    while read -r lat dom; do
+        echo "  - ${dom}: ${lat} ms"
+    done < <(sort -n "$SNI_TMP" | head -n 10)
+    BEST_LINE=$(sort -n "$SNI_TMP" | head -n 1)
+    MIN_LATENCY=$(echo "$BEST_LINE" | awk '{print $1}')
+    BEST_SNI=$(echo "$BEST_LINE" | awk '{print $2}')
+fi
+rm -f "$SNI_TMP"
+
+echo "==> 选定最低延迟 SNI (Top 1): $BEST_SNI (${MIN_LATENCY} ms)"
+
+# 7. 生成配对的 X25519 Reality 密钥与 TUIC 自签证书
 CERT_DIR=$(mktemp -d)
 openssl req -x509 -newkey rsa:2048 -nodes -sha256 -keyout "$CERT_DIR/self.key" -out "$CERT_DIR/self.crt" -days 3650 -subj "/CN=$BEST_SNI" 2>/dev/null
 CERT_PUBKEY_SHA256=$(openssl x509 -in "$CERT_DIR/self.crt" -pubkey -noout | openssl pkey -pubin -outform der | openssl dgst -sha256 -binary | base64)
 CERT_PUBKEY_HEX=$(openssl x509 -in "$CERT_DIR/self.crt" -pubkey -noout | openssl pkey -pubin -outform der | openssl dgst -sha256 -hex | awk '{print $2}')
 
-systemctl stop s-ui
+# 使用 OpenSSL 生成数学配对的 X25519 私钥与公钥（URL-safe Base64 无填充格式）
+X25519_KEY=$(openssl genpkey -algorithm X25519 2>/dev/null)
+REALITY_PRIV=$(echo "$X25519_KEY" | openssl pkey -outform DER | tail -c 32 | base64 | tr -d '\n=' | tr '+/' '-_')
+REALITY_PUB=$(echo "$X25519_KEY" | openssl pkey -pubout -outform DER | tail -c 32 | base64 | tr -d '\n=' | tr '+/' '-_')
 
-DB_FILE="$INSTALL_DIR/db/s-ui.db"
 IP=$(curl -4 -fsSL --max-time 5 https://api.ipify.org || curl -4 -fsSL --max-time 5 https://ifconfig.me || echo "127.0.0.1")
 
-# 7. Python 精准写入对齐官方架构的二进制 BLOB
+# 8. Python 精准写入对齐官方架构的二进制 BLOB
 python3 - <<PYEOF
 import sqlite3
 import json
@@ -176,17 +227,17 @@ with open("$CERT_DIR/self.key", "r") as f:
 with open("$CERT_DIR/self.crt", "r") as f:
     crt_lines = [line.strip() for line in f if line.strip()]
 
-reality_priv = secrets.token_urlsafe(32)[:43]
-reality_pub = secrets.token_urlsafe(32)[:43]
-short_id = secrets.token_hex(3)
+reality_priv = "$REALITY_PRIV"
+reality_pub = "$REALITY_PUB"
+short_id = secrets.token_hex(4)
 
 client_uuid = str(uuid.uuid4())
-client_pass = secrets.token_urlsafe(8)[:8]
+client_pass = secrets.token_urlsafe(12)[:12]
 ss_pass_1 = base64.b64encode(secrets.token_bytes(32)).decode('utf-8')
 ss_pass_2 = base64.b64encode(secrets.token_bytes(16)).decode('utf-8')
 
 # 1. TLS 表
-cur.execute("DELETE FROM tls WHERE name IN ('一', '二')")
+cur.execute("DELETE FROM tls WHERE id IN (1, 2) OR name IN ('一', '二')")
 
 tls_server_1 = {
     "enabled": True,
@@ -288,9 +339,9 @@ cur.execute("""
 """, (to_blob([]), to_blob(tuic_options), to_blob(tuic_out_json)))
 
 # 3. Clients 表
-cur.execute("DELETE FROM clients WHERE name='My'")
+cur.execute("DELETE FROM clients WHERE name LIKE 'My%'")
 
-client_name = "My"
+client_name = "$SUB_TOKEN"
 full_config = {
     "anytls": {"name": client_name, "password": client_pass},
     "http": {"name": client_name, "username": client_name, "password": client_pass},
@@ -327,7 +378,7 @@ PYEOF
 
 rm -rf "$CERT_DIR"
 
-# 8. 启动服务与防火墙放行
+# 9. 启动服务与防火墙放行
 systemctl enable s-ui >/dev/null 2>&1
 systemctl restart s-ui
 
@@ -344,9 +395,9 @@ elif command -v firewall-cmd >/dev/null 2>&1; then
     firewall-cmd --reload >/dev/null 2>&1 || true
 fi
 
-# 9. 输出通用订阅及专用 Clash 订阅链接
-SUB_URL_RAW="http://${IP}:${SUB_PORT}/sub/My"
-SUB_URL_CLASH="http://${IP}:${SUB_PORT}/sub/My?format=clash"
+# 10. 输出通用订阅及专用 Clash 订阅链接
+SUB_URL_RAW="http://${IP}:${SUB_PORT}/sub/${SUB_TOKEN}"
+SUB_URL_CLASH="http://${IP}:${SUB_PORT}/sub/${SUB_TOKEN}?format=clash"
 
 echo ""
 echo "==================== 部署与配置完成 ===================="
